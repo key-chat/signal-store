@@ -4,6 +4,7 @@
 
 use r2d2;
 use log::info;
+use rusqlite::OptionalExtension;
 use rusqlite::params;
 use rusqlite::OpenFlags;
 use async_trait::async_trait;
@@ -112,14 +113,6 @@ pub async fn init_sqlite(path: &str) -> Result<SqlitePool> {
     Ok(write_pool) 
 }
 
-//// close sqlite Database
-// pub async fn close_sqlite() -> Result<bool> {
-//     let mut database = SQLITEDB.lock().await;
-//     let has = database.is_some();
-//     if let Some(_database) = database.take() {}
-//     Ok(has)
-// }
-
 /// Reference implementation of [traits::IdentityKeyStore].
 #[derive(Clone)]
 pub struct KeyChatIdentityKeyStore {
@@ -146,7 +139,7 @@ impl KeyChatIdentityKeyStore {
             r##"select nextPrekeyId, registrationId, address, privateKey, publicKey
             from identity where address = ?1 order by id desc limit 1"##).unwrap();
 
-        let identity = stmt.query_row(params![address], |row|{
+        let identity =  stmt.query_row(params![address], |row|{
             Ok(SignalIdentitie {
                 next_prekey_id: row.get(0)?,
                 registration_id: row.get(1)?,
@@ -154,12 +147,10 @@ impl KeyChatIdentityKeyStore {
                 private_key: row.get(3)?,
                 public_key: row.get(4)?
             })
-        });
-        if identity.as_ref().ok().is_some() {
-            return  Ok(Some(identity.unwrap()));
-        } else {
-            return Ok(None)
-        } 
+        })
+        .optional()
+        .map_err(|err| SignalProtocolError::InvalidArgument(format!("get_identity_by_address identity err {:?}", err)))?;
+       Ok(identity)
     }
 
     pub fn get_identity_key_pair_keys(&self, public_key: &str, private_key: &str) -> Result<IdentityKeyPair> {
@@ -174,7 +165,9 @@ impl KeyChatIdentityKeyStore {
     pub async fn get_identity_key_pair_bak(&self, address: &str) -> Result<IdentityKeyPair> {
         let identity = self.get_identity_by_address(address).await.unwrap();
         let id_key_pair = 
-            self.get_identity_key_pair_keys(&identity.clone().unwrap().public_key, &identity.clone().unwrap().private_key.unwrap()).unwrap();
+            self.get_identity_key_pair_keys(
+                &identity.clone().unwrap().public_key, 
+                &identity.clone().unwrap().private_key.unwrap()).unwrap();
         Ok(id_key_pair)
     }
 
@@ -243,9 +236,9 @@ impl KeyChatIdentityKeyStore {
         if our_address.is_none() {
             return Ok(false);
         }
-        if our_address.clone().unwrap() == their_address {
-            let local_identity = self.get_identity_by_address(&our_address.clone().unwrap()).await.unwrap();
-            let local_id_key = self.get_identity_public_key(&local_identity.clone().unwrap().public_key).unwrap();
+        if our_address.as_ref().unwrap() == their_address {
+            let local_identity = self.get_identity_by_address(&our_address.as_ref().unwrap()).await.unwrap();
+            let local_id_key = self.get_identity_public_key(&local_identity.as_ref().unwrap().public_key).unwrap();
             return Ok(*identity == local_id_key);
         }
         match direction {
@@ -253,7 +246,7 @@ impl KeyChatIdentityKeyStore {
                 if signal_identity.is_none() {
                     return Ok(true);
                 }
-                if *identity != self.get_identity_public_key(&signal_identity.clone().unwrap().public_key).unwrap() {
+                if *identity != self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() {
                     return Ok(false);
                 }
                 return Ok(true)
@@ -289,7 +282,7 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
     ) -> Result<bool> {
         let name = address.name();
         let mut signal_identity = self.get_identity_by_address(name).await.unwrap();
-        if signal_identity.clone().is_none() {
+        if signal_identity.as_ref().is_none() {
             let _ = self.insert_identity(SignalIdentitie{
                 address: name.to_string(),
                 public_key: format!("{:?}", identity.serialize()),
@@ -299,7 +292,7 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
             }).await;
             return Ok(true);
         }
-        if self.get_identity_public_key(&signal_identity.clone().unwrap().public_key).unwrap() != *identity {
+        if self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() != *identity {
             signal_identity.as_mut().unwrap().public_key = format!("{:?}", identity.serialize());
             let _= self.insert_identity(signal_identity.unwrap()).await;
             return Ok(true);
@@ -320,7 +313,7 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
                 if signal_identity.is_none() {
                     return Ok(true);
                 }
-                if *identity != self.get_identity_public_key(&signal_identity.clone().unwrap().public_key).unwrap() {
+                if *identity != self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() {
                     return Ok(false);
                 }
                 return Ok(true)
@@ -356,6 +349,59 @@ impl KeyChatSessionStore {
             pool
         }
     }
+    
+     /// store session
+     pub async fn store_session_bak_old(&self, address: &ProtocolAddress, record: &SessionRecord, 
+        my_receiver_address: Option<&str>, to_receiver_address: Option<&str>, 
+        sender_ratchet_key: Option<&str>) -> Result<u32> {
+        let mut flag:u32 = 0;
+        let name = address.name();
+        let device_id = &address.device_id().to_string();
+        let mut session = 
+        self.get_session(name, device_id).await?;
+        if session.is_none() {
+            self.insert_session(address, record, my_receiver_address, 
+                to_receiver_address, sender_ratchet_key).await?;
+            return Ok(0);
+        }
+        let session_record = session.clone().unwrap().record;
+        let record_to_str = format!("{:?}", record.serialize().unwrap());
+        if session_record == record_to_str {
+            return Ok(1);
+        }
+        session.as_mut().unwrap().record = record_to_str;
+
+        if to_receiver_address.is_some() {
+            if session.clone().unwrap().bob_sender_ratchet_key.is_none()
+            || sender_ratchet_key != session.clone().unwrap().bob_sender_ratchet_key.as_deref() {
+                // println!("store_session_bak address {:?} to_receiver_address {:?}", address.name(), to_receiver_address);
+                session.as_mut().unwrap().bob_address = Some(to_receiver_address.unwrap().to_string());
+                session.as_mut().unwrap().bob_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
+                flag = 2;
+                self.update_session(false, session.as_ref().unwrap()).await?;
+            }
+        }
+        if my_receiver_address.is_some() {
+            if session.clone().unwrap().alice_addresses.is_none() {
+                // println!("store_session_bak address {:?} my_receiver_address {:?}", address.name(), my_receiver_address);
+                session.as_mut().unwrap().alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
+                session.as_mut().unwrap().alice_addresses = Some(my_receiver_address.unwrap().to_string());
+                flag = 3;
+
+            } else if sender_ratchet_key != session.clone().unwrap().alice_sender_ratchet_key.as_deref() {
+                session.as_mut().unwrap().alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
+                let alice_addresses2 = session.clone().unwrap().alice_addresses.unwrap();
+                let mut list: Vec<&str> = alice_addresses2.split(",").collect();
+                list.push(my_receiver_address.unwrap());
+                session.as_mut().unwrap().alice_addresses = Some(list.join(","));
+                flag = 4;
+            }
+            self.update_session(true, session.as_ref().unwrap()).await?;
+        }
+        Ok(flag)
+}
+
+
     /// store session
     pub async fn store_session_bak(&self, address: &ProtocolAddress, record: &SessionRecord, 
         my_receiver_address: Option<&str>, to_receiver_address: Option<&str>, 
@@ -375,38 +421,41 @@ impl KeyChatSessionStore {
         if session_record == record_to_str {
             return Ok(1);
         }
-        session.as_mut().unwrap().record = record_to_str;
+
+        let ss = session.as_mut().unwrap();
+        ss.record = record_to_str;
+
         if to_receiver_address.is_some() {
-            if session.clone().unwrap().bob_sender_ratchet_key.is_none()
-            || sender_ratchet_key != session.clone().unwrap().bob_sender_ratchet_key.as_deref() {
+            if ss.bob_sender_ratchet_key.is_none()
+            || sender_ratchet_key != ss.bob_sender_ratchet_key.as_deref() {
                 // println!("store_session_bak address {:?} to_receiver_address {:?}", address.name(), to_receiver_address);
-                session.as_mut().unwrap().bob_address = Some(to_receiver_address.unwrap().to_string());
-                session.as_mut().unwrap().bob_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
+                ss.bob_address = Some(to_receiver_address.unwrap().to_string());
+                ss.bob_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
                 flag = 2;
-                self.update_session(false, session.clone().unwrap()).await?;
+                self.update_session(false, ss).await?;
             }
         }
         if my_receiver_address.is_some() {
-            if session.clone().unwrap().alice_addresses.is_none() {
+            if ss.alice_addresses.is_none() {
                 // println!("store_session_bak address {:?} my_receiver_address {:?}", address.name(), my_receiver_address);
-                session.as_mut().unwrap().alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
-                session.as_mut().unwrap().alice_addresses = Some(my_receiver_address.unwrap().to_string());
+                ss.alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
+                ss.alice_addresses = Some(my_receiver_address.unwrap().to_string());
                 flag = 3;
 
-            } else if sender_ratchet_key != session.clone().unwrap().alice_sender_ratchet_key.as_deref() {
-                session.as_mut().unwrap().alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
-                let alice_addresses2 = session.clone().unwrap().alice_addresses.unwrap();
+            } else if sender_ratchet_key != ss.alice_sender_ratchet_key.as_deref() {
+                ss.alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
+                let alice_addresses2 = ss.alice_addresses.as_ref().unwrap();
                 let mut list: Vec<&str> = alice_addresses2.split(",").collect();
                 list.push(my_receiver_address.unwrap());
-                session.as_mut().unwrap().alice_addresses = Some(list.join(","));
+                ss.alice_addresses = Some(list.join(","));
                 flag = 4;
             }
-            self.update_session(true, session.clone().unwrap()).await?;
+            self.update_session(true, ss).await?;
         }
         Ok(flag)
 }
 
-    pub async fn update_session(&self, is_alice: bool,  session: SignalSession) -> Result<()> {
+    pub async fn update_session(&self, is_alice: bool,  session: &SignalSession) -> Result<()> {
         let conn = self.pool.get()
                 .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from update_session {:?}", err)))?;
         if is_alice {
@@ -414,21 +463,21 @@ impl KeyChatSessionStore {
                     , record = ?3 where address = ?4 and device = ?5"##;
                 let mut stmt = conn.prepare(sql).unwrap();
                 stmt.execute(
-                    params![session.clone().alice_sender_ratchet_key, 
-                        session.clone().alice_addresses, 
-                        session.clone().record,
-                        session.clone().address, 
-                        session.clone().device]).unwrap();
+                    params![session.alice_sender_ratchet_key, 
+                        session.alice_addresses, 
+                        session.record,
+                        session.address, 
+                        session.device]).unwrap();
         } else {
             let sql = r##"update session set bobSenderRatchetKey = ?1, bobAddress = ?2 
                             , record = ?3 where address = ?4 and device = ?5"##;
             let mut stmt = conn.prepare(sql).unwrap();
             stmt.execute(
-                params![session.clone().bob_sender_ratchet_key, 
-                    session.clone().bob_address, 
-                    session.clone().record,
-                    session.clone().address, 
-                    session.clone().device]).unwrap();
+                params![session.bob_sender_ratchet_key, 
+                    session.bob_address, 
+                    session.record,
+                    session.address, 
+                    session.device]).unwrap();
         }
         Ok(())
 
@@ -484,12 +533,10 @@ impl KeyChatSessionStore {
                 bob_address: row.get(5)?,
                 alice_addresses: row.get(6)?,
         })
-        });
-        if session.as_ref().clone().ok().is_some() {
-            return Ok(Some(session.unwrap()));
-        } else {
-            return Ok(None);
-        }
+        })
+        .optional()
+        .map_err(|err| SignalProtocolError::InvalidArgument(format!("get_session err {:?}", err)));
+        session
     }
 
     pub async fn get_all_alice_addrs(&self) -> Result<Vec<String>> {
@@ -523,12 +570,10 @@ impl KeyChatSessionStore {
                 bob_address: row.get(5)?,
                 alice_addresses: row.get(6)?,
         })
-        });
-        if session.as_ref().clone().ok().is_some() {
-            return Ok(Some(session.unwrap()));
-        } else {
-            return Ok(None);
-        }
+        })
+        .optional()
+        .map_err(|err| SignalProtocolError::InvalidArgument(format!("session_contain_alice_addr err {:?}", err)));
+        session
     }
 
     pub async fn update_alice_addr(&self, address: &str, device_id: &str, alice_addr: &str) -> Result<bool> {
@@ -595,7 +640,9 @@ impl KeyChatSessionStore {
         }
         // CIPHERTEXT_MESSAGE_CURRENT_VERSION is 3
         let ciphertext_message_current_version = 3;
-        let flag = session_record.clone().unwrap().has_sender_chain().unwrap() && session_record.clone().unwrap().session_version().unwrap() == ciphertext_message_current_version;
+        let flag = session_record.clone().unwrap().has_sender_chain().unwrap() 
+            && session_record.clone().unwrap().session_version().unwrap() 
+            == ciphertext_message_current_version;
         Ok(flag)
     }
 
@@ -619,7 +666,8 @@ impl SessionStore for KeyChatSessionStore {
          sender_ratchet_key: Option<String>,
      ) -> Result<u32> {
         let flag = self.store_session_bak(address, record, 
-            my_receiver_address.as_deref(), to_receiver_address.as_deref(), 
+            my_receiver_address.as_deref(), 
+            to_receiver_address.as_deref(), 
             sender_ratchet_key.as_deref()).await?;
         // println!("The store_session return {:?}", flag);
         Ok(flag)
@@ -640,7 +688,7 @@ impl KeyChatRatchetKeyStore {
         }
     }
 
-    pub async fn get_ratchet_key_by_public(&self, ratchet_key: &str) -> Result<SignalRatchetKey> {
+    pub async fn get_ratchet_key_by_public(&self, ratchet_key: &str) -> Result<Option<SignalRatchetKey>> {
         let conn = self.pool.get()
         .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from get_ratchet_key_by_public {:?}", err)))?;
         let sql = r##"select aliceRatchetKeyPublic, address, device, roomId, 
@@ -663,9 +711,11 @@ impl KeyChatRatchetKeyStore {
                 bob_ratchet_key_private,
                 ratche_key_hash,
             })
-        });
+        })
+        .optional()
+        .map_err(|err| SignalProtocolError::InvalidArgument(format!("get_ratchet_key_by_public err {:?}", err)));
         // println!("SignalRatchetKey {:?}", ratchet_key);
-        Ok(ratchet_key.unwrap())
+        ratchet_key
     }
 
     /// insert ratchetkey
@@ -722,8 +772,10 @@ impl KeyChatRatchetKeyStore {
 
     /// load_rathchet_key_bak
     pub async fn load_rathchet_key_bak(&self, their_ephemeral_public: String) -> Result<String>{
-        let ratchet_key = self.get_ratchet_key_by_public(&their_ephemeral_public).await;
-        let private = ratchet_key.unwrap().bob_ratchet_key_private;
+        let ratchet_key = self.get_ratchet_key_by_public(&their_ephemeral_public).await?;
+        let private = ratchet_key
+            .expect("load_rathchet_key_bak get ratchet_key err.")
+            .bob_ratchet_key_private;
         Ok(private)
     }
 
