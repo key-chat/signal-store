@@ -6,6 +6,7 @@ pub struct SignalIdentitie {
     pub next_prekey_id: Option<u64>,
     pub registration_id: Option<u32>,
     pub address: String,
+    pub device: String,
     pub private_key: Option<String>,
     pub public_key: String,
     // pub created_at: u64,
