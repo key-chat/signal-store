@@ -251,7 +251,7 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
     ) -> Result<bool> {
         let name = address.name();
         let device_id = address.device_id();
-        let mut signal_identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
+        let signal_identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
         if signal_identity.as_ref().is_none() {
             let _ = self.insert_identity(SignalIdentitie{
                 address: name.to_string(),
@@ -263,11 +263,11 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
             }).await;
             return Ok(true);
         }
-        if self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() != *identity {
-            signal_identity.as_mut().unwrap().public_key = format!("{:?}", identity.serialize());
-            let _= self.insert_identity(signal_identity.unwrap()).await;
-            return Ok(true);
-        }
+        // if self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() != *identity {
+        //     signal_identity.as_mut().unwrap().public_key = format!("{:?}", identity.serialize());
+        //     let _= self.insert_identity(signal_identity.unwrap()).await;
+        //     return Ok(true);
+        // }
         Ok(false)
     }
 
