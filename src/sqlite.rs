@@ -194,15 +194,15 @@ impl KeyChatIdentityKeyStore {
 
     pub async fn create_identity(&self, address: &ProtocolAddress, id_key_pair: &IdentityKeyPair) -> Result<bool> {
         let name = address.name();
-        let device = address.device_id().to_string();
-        let identity = self.get_identity_by_address(name, &device).await.unwrap();
+        let device_id = address.device_id();
+        let identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
         if identity.is_none() {
             let _ = self.insert_identity(
                 SignalIdentitie {
                     next_prekey_id: None,
                     registration_id: None, 
                     address: name.to_owned(), 
-                    device,
+                    device: device_id.into(),
                     private_key: Some(format!("{:?}", id_key_pair.public_key().serialize())),
                     public_key: format!("{:?}", id_key_pair.private_key().serialize())
             }).await;
@@ -250,12 +250,12 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
         identity: &IdentityKey,
     ) -> Result<bool> {
         let name = address.name();
-        let device_id = address.device_id().to_string();
-        let mut signal_identity = self.get_identity_by_address(name, &device_id).await.unwrap();
+        let device_id = address.device_id();
+        let mut signal_identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
         if signal_identity.as_ref().is_none() {
             let _ = self.insert_identity(SignalIdentitie{
                 address: name.to_string(),
-                device: device_id,
+                device: device_id.into(),
                 public_key: format!("{:?}", identity.serialize()),
                 private_key: None,
                 registration_id: None,
