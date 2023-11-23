@@ -98,7 +98,7 @@ pub fn build_pool(
 pub async fn init_sqlite(path: &str) -> Result<SqlitePool> {
         let write_pool = build_pool(
             0,
-            4,
+            10,
             path,
         );
         // 创建Signal的三个状态table
