@@ -12,7 +12,7 @@ use libsignal_protocol::*;
 use libsignal_protocol::{SessionStore, IdentityKeyStore, RatchetKeyStore};
 use r2d2_sqlite::SqliteConnectionManager;
 use libsignal_protocol::SignalProtocolError;
-use std::{convert::TryInto, path::Path, time::Duration};
+use std::{convert::TryInto, path::Path};
 use super::types::{SignalIdentitie, SignalRatchetKey, SignalSession};
 pub type Result<T> = std::result::Result<T, SignalProtocolError>;
 pub type SqlitePool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
@@ -66,8 +66,6 @@ pub const STARTUP_SQL: &str = r##"
         "##;
 
 pub fn build_pool(
-    min_size: u32,
-    max_size: u32,
     path: &str
 ) -> SqlitePool {
     let full_path = Path::new(path);
@@ -75,33 +73,23 @@ pub fn build_pool(
         SqliteConnectionManager::file(&full_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
             .with_init(|c| c.execute_batch(STARTUP_SQL));
+    // build use the default config
     let pool: SqlitePool = r2d2::Pool::builder()
-        .test_on_check_out(true) // no noticeable performance hit
-        .min_idle(Some(min_size))
-        .max_size(max_size)
-        .idle_timeout(Some(Duration::from_secs(10)))
-        .max_lifetime(Some(Duration::from_secs(30)))
         .build(manager)
         .unwrap();
     // retrieve a connection to ensure the startup statements run immediately
     {
         let _ = pool.get();
     }
-    info!(
-        "Built a connection pool (min={}, max={})",
-            min_size, max_size
-    );
     pool
 }
 
 /// Init sqlite Database
 pub async fn init_sqlite(path: &str) -> Result<SqlitePool> {
         let write_pool = build_pool(
-            0,
-            10,
             path,
         );
-        // 创建Signal的三个状态table
+        // create Signal thress state tables
         let conn = 
         write_pool.get()
             .map_err(|err| SignalProtocolError::InvalidArgument(format!("Sqlite not set {:?}", err)))?;
@@ -251,7 +239,8 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
     ) -> Result<bool> {
         let name = address.name();
         let device_id = address.device_id();
-        let signal_identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
+        let mut signal_identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
+        // new key
         if signal_identity.as_ref().is_none() {
             let _ = self.insert_identity(SignalIdentitie{
                 address: name.to_string(),
@@ -261,13 +250,16 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
                 registration_id: None,
                 next_prekey_id: None,
             }).await;
+            return Ok(false);
+        }
+        // if identity change then modify it in db? 
+        // overwrite
+        if self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() != *identity {
+            signal_identity.as_mut().unwrap().public_key = format!("{:?}", identity.serialize());
+            let _= self.insert_identity(signal_identity.unwrap()).await;
             return Ok(true);
         }
-        // if self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() != *identity {
-        //     signal_identity.as_mut().unwrap().public_key = format!("{:?}", identity.serialize());
-        //     let _= self.insert_identity(signal_identity.unwrap()).await;
-        //     return Ok(true);
-        // }
+        // same key
         Ok(false)
     }
 
@@ -303,7 +295,7 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
         if identity.is_none() {
             return Ok(None);
         }
-        let id_key =  self.get_identity_public_key(&identity.unwrap().public_key).unwrap();
+        let id_key = self.get_identity_public_key(&identity.unwrap().public_key).unwrap();
         Ok(Some(id_key))
     }
 }
