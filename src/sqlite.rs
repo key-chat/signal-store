@@ -12,7 +12,7 @@ use libsignal_protocol::*;
 use libsignal_protocol::{SessionStore, IdentityKeyStore, RatchetKeyStore};
 use r2d2_sqlite::SqliteConnectionManager;
 use libsignal_protocol::SignalProtocolError;
-use std::{convert::TryInto, path::Path, time::Duration};
+use std::{convert::TryInto, path::Path};
 use super::types::{SignalIdentitie, SignalRatchetKey, SignalSession};
 pub type Result<T> = std::result::Result<T, SignalProtocolError>;
 pub type SqlitePool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
@@ -23,6 +23,7 @@ const IDENTITY_STORE: &str = r##"
         id integer primary key AUTOINCREMENT,
         nextPrekeyId integer,
         registrationId integer,
+        device integer,
         address text,
         privateKey text,
         publicKey text,
@@ -65,8 +66,6 @@ pub const STARTUP_SQL: &str = r##"
         "##;
 
 pub fn build_pool(
-    min_size: u32,
-    max_size: u32,
     path: &str
 ) -> SqlitePool {
     let full_path = Path::new(path);
@@ -74,33 +73,23 @@ pub fn build_pool(
         SqliteConnectionManager::file(&full_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
             .with_init(|c| c.execute_batch(STARTUP_SQL));
+    // build use the default config
     let pool: SqlitePool = r2d2::Pool::builder()
-        .test_on_check_out(true) // no noticeable performance hit
-        .min_idle(Some(min_size))
-        .max_size(max_size)
-        .idle_timeout(Some(Duration::from_secs(10)))
-        .max_lifetime(Some(Duration::from_secs(30)))
         .build(manager)
         .unwrap();
     // retrieve a connection to ensure the startup statements run immediately
     {
         let _ = pool.get();
     }
-    info!(
-        "Built a connection pool (min={}, max={})",
-            min_size, max_size
-    );
     pool
 }
 
 /// Init sqlite Database
 pub async fn init_sqlite(path: &str) -> Result<SqlitePool> {
         let write_pool = build_pool(
-            0,
-            4,
             path,
         );
-        // 创建Signal的三个状态table
+        // create Signal thress state tables
         let conn = 
         write_pool.get()
             .map_err(|err| SignalProtocolError::InvalidArgument(format!("Sqlite not set {:?}", err)))?;
@@ -132,20 +121,21 @@ impl KeyChatIdentityKeyStore {
     }
 
     /// get identity by address 
-    pub async fn get_identity_by_address(&self, address: &str) -> Result<Option<SignalIdentitie>>{
+    pub async fn get_identity_by_address(&self, address: &str, device_id: &str) -> Result<Option<SignalIdentitie>>{
         let conn = self.pool.get()
                 .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from get_identity_by_address {:?}", err)))?;
         let mut stmt = conn.prepare(
-            r##"select nextPrekeyId, registrationId, address, privateKey, publicKey
-            from identity where address = ?1 order by id desc limit 1"##).unwrap();
+            r##"select nextPrekeyId, registrationId, address, device, privateKey, publicKey
+            from identity where address = ?1 and device = ?2 order by id desc limit 1"##).unwrap();
 
-        let identity =  stmt.query_row(params![address], |row|{
+        let identity =  stmt.query_row(params![address, device_id], |row|{
             Ok(SignalIdentitie {
                 next_prekey_id: row.get(0)?,
                 registration_id: row.get(1)?,
                 address: row.get(2)?,
-                private_key: row.get(3)?,
-                public_key: row.get(4)?
+                device: row.get(3)?,
+                private_key: row.get(4)?,
+                public_key: row.get(5)?
             })
         })
         .optional()
@@ -162,8 +152,8 @@ impl KeyChatIdentityKeyStore {
         Ok(id_key_pair)
     }
 
-    pub async fn get_identity_key_pair_bak(&self, address: &str) -> Result<IdentityKeyPair> {
-        let identity = self.get_identity_by_address(address).await.unwrap();
+    pub async fn get_identity_key_pair_bak(&self, address: &str, device_id: &str) -> Result<IdentityKeyPair> {
+        let identity = self.get_identity_by_address(address, device_id).await.unwrap();
         let id_key_pair = 
             self.get_identity_key_pair_keys(
                 &identity.clone().unwrap().public_key, 
@@ -171,8 +161,8 @@ impl KeyChatIdentityKeyStore {
         Ok(id_key_pair)
     }
 
-    pub async fn get_local_registration_id_bak(&self, address: &str) -> Result<u32> {
-        let identity = self.get_identity_by_address(address).await.unwrap();
+    pub async fn get_local_registration_id_bak(&self, address: &str, device_id: &str) -> Result<u32> {
+        let identity = self.get_identity_by_address(address, device_id).await.unwrap();
         let registration_id = identity.unwrap().registration_id.unwrap();
         Ok(registration_id)
     }
@@ -183,22 +173,24 @@ impl KeyChatIdentityKeyStore {
                 .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from insert_identity {:?}", err)))?;
 
         let sql = r##"INSERT INTO identity (nextPrekeyId, registrationId, 
-            address, privateKey, publicKey) values (?1, ?2, ?3, ?4, ?5)"##;
+            address, device, privateKey, publicKey) values (?1, ?2, ?3, ?4, ?5, ?6)"##;
         let mut stmt = conn.prepare(sql).unwrap();
         stmt.execute(params![&identity.next_prekey_id, &identity.registration_id, 
-            &identity.address, &identity.private_key, &identity.public_key]).unwrap();    
+            &identity.address, &identity.device, &identity.private_key, &identity.public_key]).unwrap();    
         Ok(())
     }
 
     pub async fn create_identity(&self, address: &ProtocolAddress, id_key_pair: &IdentityKeyPair) -> Result<bool> {
         let name = address.name();
-        let identity = self.get_identity_by_address(name).await.unwrap();
+        let device_id = address.device_id();
+        let identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
         if identity.is_none() {
             let _ = self.insert_identity(
                 SignalIdentitie {
                     next_prekey_id: None,
                     registration_id: None, 
                     address: name.to_owned(), 
+                    device: device_id.into(),
                     private_key: Some(format!("{:?}", id_key_pair.public_key().serialize())),
                     public_key: format!("{:?}", id_key_pair.private_key().serialize())
             }).await;
@@ -224,45 +216,11 @@ impl KeyChatIdentityKeyStore {
         }
     }
 
-    pub async fn is_trusted_identity_bak(
-        &self,
-        our_address: Option<String>,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-        direction: Direction,
-    ) -> Result<bool> {
-        let their_address = address.name();
-        let signal_identity = self.get_identity_by_address(their_address).await.unwrap();
-        if our_address.is_none() {
-            return Ok(false);
-        }
-        if our_address.as_ref().unwrap() == their_address {
-            let local_identity = self.get_identity_by_address(&our_address.as_ref().unwrap()).await.unwrap();
-            let local_id_key = self.get_identity_public_key(&local_identity.as_ref().unwrap().public_key).unwrap();
-            return Ok(*identity == local_id_key);
-        }
-        match direction {
-            Direction::Sending => {
-                if signal_identity.is_none() {
-                    return Ok(true);
-                }
-                if *identity != self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() {
-                    return Ok(false);
-                }
-                return Ok(true)
-            }
-            Direction::Receiving => {
-                return Ok(true);
-            }
-        }
-    }
-
 }
 
 
 #[async_trait(?Send)]
 impl IdentityKeyStore for KeyChatIdentityKeyStore {
-    /// use get_identity_key_pair_bak instead
     async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair> {
         // let mut csprng = OsRng;
         // let id_key_pair = IdentityKeyPair::generate(&mut csprng);
@@ -270,7 +228,6 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
         Ok(self.key_pair)
     }
 
-   /// use get_local_registration_id_bak instead
     async fn get_local_registration_id(&self) -> Result<u32> {
         Ok(self.registration_id)
     }
@@ -281,22 +238,28 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
         identity: &IdentityKey,
     ) -> Result<bool> {
         let name = address.name();
-        let mut signal_identity = self.get_identity_by_address(name).await.unwrap();
+        let device_id = address.device_id();
+        let mut signal_identity = self.get_identity_by_address(name, &device_id.to_string()).await.unwrap();
+        // new key
         if signal_identity.as_ref().is_none() {
             let _ = self.insert_identity(SignalIdentitie{
                 address: name.to_string(),
+                device: device_id.into(),
                 public_key: format!("{:?}", identity.serialize()),
                 private_key: None,
                 registration_id: None,
                 next_prekey_id: None,
             }).await;
-            return Ok(true);
+            return Ok(false);
         }
+        // if identity change then modify it in db? 
+        // overwrite
         if self.get_identity_public_key(&signal_identity.as_ref().unwrap().public_key).unwrap() != *identity {
             signal_identity.as_mut().unwrap().public_key = format!("{:?}", identity.serialize());
             let _= self.insert_identity(signal_identity.unwrap()).await;
             return Ok(true);
         }
+        // same key
         Ok(false)
     }
 
@@ -307,7 +270,8 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
         direction: Direction,
     ) -> Result<bool> {
         let their_address = address.name();
-        let signal_identity = self.get_identity_by_address(their_address).await.unwrap();
+        let device_id = address.device_id().to_string();
+        let signal_identity = self.get_identity_by_address(their_address, &device_id).await.unwrap();
         match direction {
             Direction::Sending => {
                 if signal_identity.is_none() {
@@ -326,11 +290,12 @@ impl IdentityKeyStore for KeyChatIdentityKeyStore {
 
     async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
         let name = address.name();
-        let identity = self.get_identity_by_address(name).await.unwrap();
+        let device_id = address.device_id().to_string();
+        let identity = self.get_identity_by_address(name, &device_id).await.unwrap();
         if identity.is_none() {
             return Ok(None);
         }
-        let id_key =  self.get_identity_public_key(&identity.unwrap().public_key).unwrap();
+        let id_key = self.get_identity_public_key(&identity.unwrap().public_key).unwrap();
         Ok(Some(id_key))
     }
 }
@@ -349,58 +314,6 @@ impl KeyChatSessionStore {
             pool
         }
     }
-    
-     /// store session
-     pub async fn store_session_bak_old(&self, address: &ProtocolAddress, record: &SessionRecord, 
-        my_receiver_address: Option<&str>, to_receiver_address: Option<&str>, 
-        sender_ratchet_key: Option<&str>) -> Result<u32> {
-        let mut flag:u32 = 0;
-        let name = address.name();
-        let device_id = &address.device_id().to_string();
-        let mut session = 
-        self.get_session(name, device_id).await?;
-        if session.is_none() {
-            self.insert_session(address, record, my_receiver_address, 
-                to_receiver_address, sender_ratchet_key).await?;
-            return Ok(0);
-        }
-        let session_record = session.clone().unwrap().record;
-        let record_to_str = format!("{:?}", record.serialize().unwrap());
-        if session_record == record_to_str {
-            return Ok(1);
-        }
-        session.as_mut().unwrap().record = record_to_str;
-
-        if to_receiver_address.is_some() {
-            if session.clone().unwrap().bob_sender_ratchet_key.is_none()
-            || sender_ratchet_key != session.clone().unwrap().bob_sender_ratchet_key.as_deref() {
-                // println!("store_session_bak address {:?} to_receiver_address {:?}", address.name(), to_receiver_address);
-                session.as_mut().unwrap().bob_address = Some(to_receiver_address.unwrap().to_string());
-                session.as_mut().unwrap().bob_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
-                flag = 2;
-                self.update_session(false, session.as_ref().unwrap()).await?;
-            }
-        }
-        if my_receiver_address.is_some() {
-            if session.clone().unwrap().alice_addresses.is_none() {
-                // println!("store_session_bak address {:?} my_receiver_address {:?}", address.name(), my_receiver_address);
-                session.as_mut().unwrap().alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
-                session.as_mut().unwrap().alice_addresses = Some(my_receiver_address.unwrap().to_string());
-                flag = 3;
-
-            } else if sender_ratchet_key != session.clone().unwrap().alice_sender_ratchet_key.as_deref() {
-                session.as_mut().unwrap().alice_sender_ratchet_key = Some(sender_ratchet_key.unwrap().to_string());
-                let alice_addresses2 = session.clone().unwrap().alice_addresses.unwrap();
-                let mut list: Vec<&str> = alice_addresses2.split(",").collect();
-                list.push(my_receiver_address.unwrap());
-                session.as_mut().unwrap().alice_addresses = Some(list.join(","));
-                flag = 4;
-            }
-            self.update_session(true, session.as_ref().unwrap()).await?;
-        }
-        Ok(flag)
-}
-
 
     /// store session
     pub async fn store_session_bak(&self, address: &ProtocolAddress, record: &SessionRecord, 
