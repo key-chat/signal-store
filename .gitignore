@@ -6,4 +6,3 @@
 .buildlog/
 .history
 .svn/
-Cargo.lock
