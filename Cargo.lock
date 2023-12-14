@@ -1047,7 +1047,7 @@ checksum = "4ec2a862134d2a7d32d7983ddcdd1c4923530833c9f2ea1a44fc5fa473989058"
 [[package]]
 name = "libsignal-protocol"
 version = "0.1.0"
-source = "git+https://github.com/key-chat/libsignal.git?branch=db2#cf12d49b1ffe060eb6531567a6cdc7a7f1d4174d"
+source = "git+https://github.com/key-chat/libsignal.git?branch=db4#6866a02aa1e5c8e16f82f590981d31fd922587a5"
 dependencies = [
  "aes 0.7.5",
  "aes-gcm-siv",
@@ -1921,7 +1921,7 @@ dependencies = [
 [[package]]
 name = "signal-crypto"
 version = "0.1.0"
-source = "git+https://github.com/key-chat/libsignal.git?branch=db2#df8e3ca706ea364309895475e3463bca7fb81b0d"
+source = "git+https://github.com/key-chat/libsignal.git?branch=db4#6866a02aa1e5c8e16f82f590981d31fd922587a5"
 dependencies = [
  "aes 0.7.5",
  "block-modes",
