@@ -315,11 +315,12 @@ impl KeyChatSessionStore {
         }
     }
 
-    /// store session
+    /// store session return update flag and alice_addr_previous
     pub async fn store_session_bak(&self, address: &ProtocolAddress, record: &SessionRecord, 
         my_receiver_address: Option<&str>, to_receiver_address: Option<&str>, 
-        sender_ratchet_key: Option<&str>) -> Result<u32> {
+        sender_ratchet_key: Option<&str>) -> Result<(u32, Option<Vec<String>>)> {
         let mut flag:u32 = 0;
+        let mut alice_addrs_pre: Option<Vec<String>> = None;
         let name = address.name();
         let device_id = &address.device_id().to_string();
         let mut session = 
@@ -327,12 +328,12 @@ impl KeyChatSessionStore {
         if session.is_none() {
             self.insert_session(address, record, my_receiver_address, 
                 to_receiver_address, sender_ratchet_key).await?;
-            return Ok(0);
+            return Ok((0, alice_addrs_pre));
         }
         let session_record = session.clone().unwrap().record;
         let record_to_str = format!("{:?}", record.serialize().unwrap());
         if session_record == record_to_str {
-            return Ok(1);
+            return Ok((1, alice_addrs_pre));
         }
 
         let ss = session.as_mut().unwrap();
@@ -363,9 +364,11 @@ impl KeyChatSessionStore {
                 ss.alice_addresses = Some(list.join(","));
                 flag = 4;
             }
+            // only get alice addrs previous when update
+            alice_addrs_pre = Some(self.get_alice_addrs_by_identity(name, device_id).await?);
             self.update_session(true, ss).await?;
         }
-        Ok(flag)
+        Ok((flag, alice_addrs_pre))
 }
 
     pub async fn update_session(&self, is_alice: bool,  session: &SignalSession) -> Result<()> {
@@ -454,7 +457,7 @@ impl KeyChatSessionStore {
 
     pub async fn get_all_alice_addrs(&self) -> Result<Vec<String>> {
         let conn = self.pool.get()
-                .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from get_session {:?}", err)))?;
+                .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from get_all_alice_addrs {:?}", err)))?;
         let mut stmt = conn.prepare("select aliceAddresses from session").unwrap();
         let addresses = stmt.query_map([], |row| row.get(0)).unwrap();
         let mut alice_addrs = Vec::new();
@@ -466,9 +469,23 @@ impl KeyChatSessionStore {
         Ok(alice_addrs)
     }
 
+    pub async fn get_alice_addrs_by_identity(&self, address: &str, device_id: &str) -> Result<Vec<String>> {
+        let conn = self.pool.get()
+                .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from get_alice_addrs_by_identity {:?}", err)))?;
+        let mut stmt = conn.prepare("select aliceAddresses from session where address = ?1 and device = ?2 order by id desc limit 1").unwrap();
+        let addresses = stmt.query_map(params![address, device_id], |row| row.get(0)).unwrap();
+        let mut alice_addrs = Vec::new();
+        for addr in addresses {
+            if addr.is_ok() {
+                alice_addrs.push(addr.unwrap());
+            }
+        }
+        Ok(alice_addrs)
+    }
+
     pub async fn session_contain_alice_addr(&self, sub_address: &str) -> Result<Option<SignalSession>> {
         let conn = self.pool.get()
-                .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from get_session {:?}", err)))?;
+                .map_err(|err| SignalProtocolError::InvalidArgument(format!("Can not get conn from session_contain_alice_addr {:?}", err)))?;
         let mut stmt = conn.prepare(
             r##"select aliceSenderRatchetKey, address, device, record, 
                 bobSenderRatchetKey, bobAddress, aliceAddresses from session 
@@ -577,13 +594,13 @@ impl SessionStore for KeyChatSessionStore {
          my_receiver_address: Option<String>,
          to_receiver_address: Option<String>,
          sender_ratchet_key: Option<String>,
-     ) -> Result<u32> {
-        let flag = self.store_session_bak(address, record, 
+     ) -> Result<(u32, Option<Vec<String>>)> {
+        let result = self.store_session_bak(address, record, 
             my_receiver_address.as_deref(), 
             to_receiver_address.as_deref(), 
             sender_ratchet_key.as_deref()).await?;
         // println!("The store_session return {:?}", flag);
-        Ok(flag)
+        Ok(result)
      }
 }
 
@@ -846,7 +863,7 @@ impl SessionStore for KeyChatSignalProtocolStore {
         my_receiver_address: Option<String>,
         to_receiver_address: Option<String>,
         sender_ratchet_key: Option<String>,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<Vec<String>>)> {
         self.session_store.store_session(address, record, my_receiver_address, to_receiver_address, sender_ratchet_key).await
     }
 }
